@@ -1,0 +1,200 @@
+```{r setup, include=TRUE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+library(nloptr)
+
+# --- 1. DEFINE CONSTANTS ---
+N <- 100               # Number of discrete time steps
+dt <- 5.0            # Time step duration (seconds) - Total flight time = 500s
+g0 <- 9.81            # Sea-level gravity (m/s^2)
+Isp <- 311            # Specific impulse of Falcon Heavy Vacuum engine (seconds)
+U_max <- 934000       # Max thrust of Merlin Vacuum engine (Newtons)
+m_dry <- 22200        # Empty mass of Falcon 9 upper stage + payload (kg)
+m_initial <- 111500   # Fully fueled initial mass (kg)
+target_alt <- 1000000 # 1000 km target altitude (meters)
+target_vel <- 7350    # Orbital velocity at 1000 km (m/s)
+
+
+# NEW: Staging Constants
+N_stage <- 25              # The exact node where staging happens (Splice Point)
+m_booster_drop <- 30000    # The mass of the empty boosters falling away (kg)
+
+# NEW: Updated unpack function to extract the Free Time variable
+unpack_state <- function(x) {
+  list(
+    h = x[1:N],
+    v = x[(N + 1):(2 * N)],
+    m = x[(2 * N + 1):(3 * N)],
+    u = x[(3 * N + 1):(4 * N)],
+    t_f = x[4 * N + 1]       # The very last number is our Total Flight Time!
+  )
+}
+
+
+# --- 2. SETUP GLOBAL TRACKING (Must go here!) ---
+iteration_history <<- list()
+eval_count <<- 0
+
+# --- 3. THE OBJECTIVE FUNCTION ---
+eval_f <- function(x) {
+  state <- unpack_state(x)
+  eval_count <<- eval_count + 1
+  
+  # Take a snapshot of the altitude array every 500 evaluations
+  if (eval_count %% 500 == 0) {
+    iteration_history[[length(iteration_history) + 1]] <<- state$h
+  }
+  
+  return(-state$m[N]) 
+}
+
+# --- 4. EQUALITY CONSTRAINTS (Physics) ---
+# nloptr expects this function to return a vector of values that must equal ZERO.
+eval_g_eq <- function(x) {
+  state <- unpack_state(x)
+  eq_constraints <- numeric(0)
+  
+  # NEW: Time step is now dynamically chosen by the solver
+  dt <- state$t_f / (N - 1)
+  # A. Initial State Constraints (Launch Pad)
+  eq_constraints <- c(eq_constraints, state$h[1] - 0)           # Start at altitude 0
+  eq_constraints <- c(eq_constraints, state$v[1] - 0)           # Start at velocity 0
+  eq_constraints <- c(eq_constraints, state$m[1] - m_initial)   # Start fully fueled
+  
+  # B. Terminal State Constraints (1000 km Orbit)
+  eq_constraints <- c(eq_constraints, state$h[N] - target_alt)  # End at 1000km
+  eq_constraints <- c(eq_constraints, state$v[N] - target_vel)  # End at orbital speed
+  
+  # C. System Dynamics (Euler Integration across all time steps)
+  #Physics loop
+  for (k in 1:(N - 1)) {
+    # Gravity gets weaker with altitude (Newton's law approximation)
+    g_current <- g0 * (6371000 / (6371000 + state$h[k]))^2
+    
+    # Kinematics: h[k+1] = h[k] + v[k]*dt
+    dh <- state$h[k+1] - (state$h[k] + state$v[k] * dt)
+    
+    # Kinetics: v[k+1] = v[k] + (Thrust/Mass - Gravity) * dt
+    dv <- state$v[k+1] - (state$v[k] + (state$u[k] / state$m[k] - g_current) * dt)
+    
+    # NEW: THE SPLICE POINT
+    if (k == N_stage) {
+      # At this exact step, subtract fuel burned AND the empty booster mass
+      dm <- state$m[k+1] - (state$m[k] - m_booster_drop - (state$u[k] / (Isp * g0)) * dt)
+    } else {
+      # Normal mass depletion
+      dm <- state$m[k+1] - (state$m[k] - (state$u[k] / (Isp * g0)) * dt)
+    }
+    
+    eq_constraints <- c(eq_constraints, dh, dv, dm)
+  }
+  
+  return(eq_constraints)
+}
+
+
+
+
+# --- 4. INITIAL GUESS & BOUNDS ---
+# Guess it takes about 600 seconds to reach orbit
+t_f_guess <- 600 
+
+t_guess <- seq(0, 1, length.out = N)
+x0_h <- target_alt * (t_guess^2)      
+x0_v <- target_vel * t_guess          
+x0_m <- seq(m_initial, m_dry, length.out = N)
+x0_u <- rep(U_max * 0.8, N) 
+
+# Combine arrays AND append the time guess to the end
+x0 <- c(x0_h, x0_v, x0_m, x0_u, t_f_guess)
+
+# Define Bounds (Adding limits for our new Time variable)
+lb <- c(rep(0, N), rep(-1000, N), rep(m_dry, N), rep(0, N), 100)  # Time must be > 100s            
+ub <- c(rep(target_alt * 2, N), rep(target_vel * 2, N), rep(m_initial, N), rep(U_max, N), 2000) # Time < 2000s        
+
+# --- 5. RUN THE SOLVER ---
+opts <- list(
+  "algorithm" = "NLOPT_LN_COBYLA", 
+  "xtol_rel" = 1.0e-5,          
+  "maxeval" = 20000,            
+  "print_level" = 1
+)
+
+result <- nloptr(x0 = x0, eval_f = eval_f, eval_g_eq = eval_g_eq, lb = lb, ub = ub, opts = opts
+)
+
+
+# Unpack and Print 
+optimal_trajectory <- unpack_state(result$solution)
+
+cat("\n--- OPTIMAL FINAL STATE ---\n")
+cat("Final Altitude:", optimal_trajectory$h[N], "meters\n")
+cat("Final Velocity:", optimal_trajectory$v[N], "m/s\n")
+cat("Final Mass:    ", optimal_trajectory$m[N], "kg\n")
+
+
+#Extract the best mathematical vector the solver found
+best_x <- result$solution
+
+#Unpack that giant vector back into physical rocket states
+optimal_trajectory <- unpack_state(best_x)
+
+cat(result$message, "\n")
+print(result)
+
+# --- 7. ANIMATE THE RESULTS ---
+time_steps <- seq(0, (N-1)*dt, by=dt)
+
+# Define our Splice Points (Assuming MECO happens around 150 seconds)
+t_MECO <- 150       # Main Engine Cutoff
+t_StageSep <- 155   # First Stage separates (Mass drops instantaneously)
+t_SES <- 160        # Second Engine Start
+
+# Set up a 3-row, 1-column layout for stacked graphs
+par(mfrow = c(3, 1), mar = c(4, 4, 2, 1))
+
+# 1. Altitude Graph
+plot(time_steps, optimal_trajectory$h / 1000, type="l", lwd=3, col="darkblue",
+     main="Altitude vs Time", xlab="", ylab="Altitude (km)")
+# Add Splice Lines
+abline(v = c(t_MECO, t_StageSep, t_SES), col=c("red", "black", "green"), lty=2, lwd=2)
+legend("topleft", legend=c("MECO", "Stage Sep", "SES"), col=c("red", "black", "green"), lty=2)
+
+# 2. Velocity Graph (You will see the acceleration change here!)
+plot(time_steps, optimal_trajectory$v, type="l", lwd=3, col="darkorange",
+     main="Velocity vs Time", xlab="", ylab="Velocity (m/s)")
+abline(v = c(t_MECO, t_StageSep, t_SES), col=c("red", "black", "green"), lty=2, lwd=2)
+
+# 3. Mass Depletion Graph (Showing the instantaneous mass drop)
+plot(time_steps, optimal_trajectory$m / 1000, type="l", lwd=3, col="purple",
+     main="Vehicle Mass vs Time", xlab="Time (seconds)", ylab="Mass (Metric Tons)")
+abline(v = c(t_MECO, t_StageSep, t_SES), col=c("red", "black", "green"), lty=2, lwd=2)
+
+# Reset plot layout to default
+par(mfrow = c(1, 1))
+
+
+
+
+##############################$%&*&^%^&**$&^*^%$*&^&*&^^&
+
+# --- 7. ANIMATE THE RESULTS ---
+time_steps <- seq(0, (N-1)*dt, by=dt)
+
+cat("Playing animation in Plot viewer...\n")
+for(i in 1:length(iteration_history)) {
+  plot(time_steps, iteration_history[[i]] / 1000, type="l", 
+       lwd=2, col="gray",
+       ylim=c(0, (target_alt * 1.2) / 1000),
+       main=paste("Optimizer Iteration:", i * 500),
+       xlab="Time (seconds)", 
+       ylab="Altitude (km)")
+  
+  Sys.sleep(0.1) 
+}
+
+# Draw the final optimal solution clearly over the top
+lines(time_steps, optimal_trajectory$h / 1000, lwd=3, col="blue")
+
+```
